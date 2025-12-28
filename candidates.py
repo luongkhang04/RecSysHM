@@ -407,7 +407,11 @@ def create_graph_diffusion_candidates(
     last_week = seed_t["week_number"].max()
     seed_t = seed_t.query(f"week_number >= {last_week - seed_weeks + 1}").copy()
     seed_t = seed_t.drop_duplicates(["customer_id", "article_id", "week_number"]) 
-    seed_t = seed_t.sort_values(["customer_id", "week_number"], ascending=[True, False])
+    # Avoid cuDF warning: don't pass a boolean sequence to `ascending`.
+    # Sort by customer_id asc, week_number desc via a negated key.
+    seed_t["_neg_week_number"] = (-seed_t["week_number"]).astype("int16")
+    seed_t = seed_t.sort_values(["customer_id", "_neg_week_number"], ascending=True)
+    del seed_t["_neg_week_number"]
     seed_t = cudf_groupby_head(seed_t, "customer_id", seed_articles)
 
     if recency_weight:
@@ -476,9 +480,10 @@ def create_graph_diffusion_candidates(
         scored = scored[scored["_seed"].isna()].copy()
         del scored["_seed"]
 
-    scored = scored.sort_values(
-        ["customer_id", "score", "article_id"], ascending=[True, False, True]
-    )
+    # Avoid cuDF warning: sort by customer_id asc, score desc, article_id asc
+    scored["_neg_score"] = (-scored["score"]).astype("float32")
+    scored = scored.sort_values(["customer_id", "_neg_score", "article_id"], ascending=True)
+    del scored["_neg_score"]
     scored = scored.reset_index(drop=True)
 
     cand = cudf_groupby_head(scored[["customer_id", "article_id"]], "customer_id", topk)
