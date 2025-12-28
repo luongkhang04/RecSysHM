@@ -369,7 +369,7 @@ def filter_candidates(candidates, transactions_df, **kwargs):
     return candidates
 
 
-def create_graph_diffusion_candidates(
+def create_random_walk_candidates(
     transactions_df,
     article_pairs_df,
     seed_weeks=12,
@@ -382,7 +382,7 @@ def create_graph_diffusion_candidates(
     exclude_seed_items=True,
     customers=None,
 ):
-    """Graph diffusion candidates via random-walk-with-restart over an item-item graph.
+    """Random walk with restart candidates over an item-item graph.
 
     This uses the provided `article_pairs_df` as a sparse directed item-item graph
     (article_id -> pair_article_id) with edge weights (e.g. customer_count).
@@ -462,7 +462,7 @@ def create_graph_diffusion_candidates(
     )
     edges = edges[["article_id", "pair_article_id", "edge_w"]]
 
-    # --- Diffusion iterations ---
+    # --- Random Walk ---
     cur = p0.rename(columns={"p0": "score"}).copy()
 
     for _ in range(num_steps):
