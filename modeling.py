@@ -10,6 +10,59 @@ from lightgbm import LGBMRanker
 from sklearn.metrics import roc_auc_score
 
 
+def _df_to_float32(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a pandas DataFrame to numeric float32.
+
+    Any non-numeric columns (object/category/bool) are encoded deterministically so
+    training/eval/submission get consistent values.
+    """
+
+    from pandas.api.types import (
+        is_bool_dtype,
+        is_categorical_dtype,
+        is_datetime64_any_dtype,
+        is_numeric_dtype,
+    )
+
+    out = df.copy()
+
+    for col in out.columns:
+        s = out[col]
+
+        if is_numeric_dtype(s.dtype):
+            out[col] = s.astype("float32", copy=False)
+            continue
+
+        if is_bool_dtype(s.dtype):
+            out[col] = s.astype("float32", copy=False)
+            continue
+
+        if is_datetime64_any_dtype(s.dtype):
+            # nanosecond timestamps -> seconds (float32)
+            out[col] = (s.view("int64") / 1e9).astype("float32")
+            continue
+
+        if is_categorical_dtype(s.dtype):
+            codes = s.cat.codes.astype("float32")
+            # pandas uses -1 for NaN in categorical codes
+            out[col] = codes.replace(-1, np.nan)
+            continue
+
+        # object / string-like
+        numeric = pd.to_numeric(s, errors="coerce")
+        numeric_ok = numeric.notna().sum() >= max(1, int(0.9 * s.notna().sum()))
+        if numeric_ok:
+            out[col] = numeric.astype("float32")
+            continue
+
+        # deterministic encoding for arbitrary strings/objects
+        filled = s.astype("string").fillna("__nan__")
+        hashed = pd.util.hash_pandas_object(filled, index=False).astype("uint64")
+        out[col] = (hashed % np.uint32(-1)).astype("float32")
+
+    return out
+
+
 def get_group_lengths(df):
     """
     Get group_lengths to pass to LGBMRanker
@@ -114,7 +167,7 @@ def prepare_modeling_dfs(t, c, a, cand_features_func, **params):
     # prep for pandas
     prep_cudf_to_pandas(X, inplace=True)
     prep_cudf_to_pandas(y, inplace=True)
-    X = X.to_pandas().astype("float32")
+    X = _df_to_float32(X.to_pandas())
     y = y.to_pandas().astype("float32")
 
     y = y["match"]
@@ -136,7 +189,7 @@ def prepare_prediction_dfs(t, c, a, cand_features_func, customer_batch=None, **p
 
     # prep for pandas
     prep_cudf_to_pandas(X, inplace=True)
-    X = X.to_pandas().astype("float32")
+    X = _df_to_float32(X.to_pandas())
 
     return ids_df, X
 
