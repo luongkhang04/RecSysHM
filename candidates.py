@@ -367,3 +367,127 @@ def filter_candidates(candidates, transactions_df, **kwargs):
     candidates = candidates[candidates["article_id"].isin(recent_articles)].copy()
 
     return candidates
+
+
+def create_graph_diffusion_candidates(
+    transactions_df,
+    article_pairs_df,
+    seed_weeks=12,
+    seed_articles=12,
+    num_steps=2,
+    restart_prob=0.2,
+    topk=24,
+    weight_col="customer_count",
+    recency_weight=True,
+    exclude_seed_items=True,
+    customers=None,
+):
+    """Graph diffusion candidates via random-walk-with-restart over an item-item graph.
+
+    This uses the provided `article_pairs_df` as a sparse directed item-item graph
+    (article_id -> pair_article_id) with edge weights (e.g. customer_count).
+
+    Returns:
+        cand_df: cudf.DataFrame[customer_id, article_id]
+        features: (['customer_id','article_id'], df) where df contains `gd_score`
+    """
+
+    if num_steps < 1:
+        raise ValueError("num_steps must be >= 1")
+    if not (0.0 <= restart_prob <= 1.0):
+        raise ValueError("restart_prob must be in [0, 1]")
+    if topk < 1:
+        raise ValueError("topk must be >= 1")
+
+    # --- Seeds (per-customer distribution over recent items) ---
+    seed_t = transactions_df[["customer_id", "article_id", "week_number"]].copy()
+    if customers is not None:
+        seed_t = seed_t[seed_t["customer_id"].isin(customers)]
+
+    last_week = seed_t["week_number"].max()
+    seed_t = seed_t.query(f"week_number >= {last_week - seed_weeks + 1}").copy()
+    seed_t = seed_t.drop_duplicates(["customer_id", "article_id", "week_number"]) 
+    seed_t = seed_t.sort_values(["customer_id", "week_number"], ascending=[True, False])
+    seed_t = cudf_groupby_head(seed_t, "customer_id", seed_articles)
+
+    if recency_weight:
+        # week_number is relative (last week is 0, earlier weeks are negative)
+        seed_t["seed_w"] = (1.0 / ((-seed_t["week_number"]) + 1.0)).astype("float32")
+    else:
+        seed_t["seed_w"] = cudf.Series([1.0] * len(seed_t), index=seed_t.index).astype(
+            "float32"
+        )
+
+    seed = (
+        seed_t.groupby(["customer_id", "article_id"])[["seed_w"]]
+        .sum()
+        .reset_index()
+    )
+    totals = seed.groupby("customer_id")["seed_w"].sum()
+    seed["p0"] = (seed["seed_w"] / seed["customer_id"].map(totals)).astype("float32")
+    p0 = seed[["customer_id", "article_id", "p0"]].copy()
+    seed_items = p0[["customer_id", "article_id"]].copy()
+    del seed_t, seed
+
+    # --- Graph edges (normalize outgoing weights) ---
+    edges = article_pairs_df[["article_id", "pair_article_id", weight_col]].copy()
+    edges = edges.dropna()
+    edges[weight_col] = edges[weight_col].astype("float32")
+
+    denom = edges.groupby("article_id")[weight_col].sum()
+    edges["edge_w"] = (edges[weight_col] / edges["article_id"].map(denom)).astype(
+        "float32"
+    )
+    edges = edges[["article_id", "pair_article_id", "edge_w"]]
+
+    # --- Diffusion iterations ---
+    cur = p0.rename(columns={"p0": "score"}).copy()
+
+    for _ in range(num_steps):
+        propagated = cur.merge(edges, on="article_id", how="inner")
+        propagated["prop_score"] = (propagated["score"] * propagated["edge_w"]).astype(
+            "float32"
+        )
+        propagated = (
+            propagated.groupby(["customer_id", "pair_article_id"])[["prop_score"]]
+            .sum()
+            .reset_index()
+        )
+        propagated.columns = ["customer_id", "article_id", "prop_score"]
+
+        combined = propagated.merge(p0, on=["customer_id", "article_id"], how="outer")
+        combined["prop_score"] = combined["prop_score"].fillna(0).astype("float32")
+        combined["p0"] = combined["p0"].fillna(0).astype("float32")
+        combined["score"] = (
+            restart_prob * combined["p0"] + (1.0 - restart_prob) * combined["prop_score"]
+        ).astype("float32")
+        cur = combined[["customer_id", "article_id", "score"]].copy()
+
+        # normalize to keep numbers stable (optional but cheap)
+        s = cur.groupby("customer_id")["score"].sum()
+        cur["score"] = (cur["score"] / cur["customer_id"].map(s)).astype("float32")
+
+    scored = cur
+
+    if exclude_seed_items:
+        scored = scored.merge(
+            seed_items.assign(_seed=1), on=["customer_id", "article_id"], how="left"
+        )
+        scored = scored[scored["_seed"].isna()].copy()
+        del scored["_seed"]
+
+    scored = scored.sort_values(
+        ["customer_id", "score", "article_id"], ascending=[True, False, True]
+    )
+    scored = scored.reset_index(drop=True)
+
+    cand = cudf_groupby_head(scored[["customer_id", "article_id"]], "customer_id", topk)
+    cand = cand.sort_values(["customer_id", "article_id"]).reset_index(drop=True)
+
+    # restrict feature df to chosen candidates to keep shelve small
+    feat = cand.merge(scored, on=["customer_id", "article_id"], how="left")
+    feat = feat[["customer_id", "article_id", "score"]].copy()
+    feat.columns = ["customer_id", "article_id", "gd_score"]
+    feat = feat.set_index(["customer_id", "article_id"])
+
+    return cand, (["customer_id", "article_id"], feat)
