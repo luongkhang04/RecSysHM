@@ -444,8 +444,11 @@ def create_graph_diffusion_candidates(
     if restart_prob == "adaptive":
         # customer-specific restart: if <3 seed items => 0.3 else 0.2
         seed_counts = p0.groupby("customer_id")["article_id"].count()
-        restart_map = cudf.Series(0.2, index=seed_counts.index).astype("float32")
-        restart_map = restart_map.where(seed_counts >= 3, 0.3).astype("float32")
+        # Use arithmetic instead of `.where` on a scalar Series to avoid shape issues.
+        # restart = 0.2 + 0.1 * 1[seed_count < 3]
+        restart_map = (0.2 + 0.1 * (seed_counts < 3).astype("float32")).astype(
+            "float32"
+        )
     del seed_t, seed
 
     # --- Graph edges (normalize outgoing weights) ---
