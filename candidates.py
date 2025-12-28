@@ -394,8 +394,16 @@ def create_graph_diffusion_candidates(
 
     if num_steps < 1:
         raise ValueError("num_steps must be >= 1")
-    if not (0.0 <= restart_prob <= 1.0):
-        raise ValueError("restart_prob must be in [0, 1]")
+    # restart_prob can be a float or the string "adaptive" (per-customer)
+    if isinstance(restart_prob, (int, float)):
+        restart_prob = float(restart_prob)
+        if not (0.0 <= restart_prob <= 1.0):
+            raise ValueError("restart_prob must be in [0, 1]")
+    elif isinstance(restart_prob, str):
+        if restart_prob != "adaptive":
+            raise ValueError('restart_prob must be a float in [0,1] or "adaptive"')
+    else:
+        raise ValueError('restart_prob must be a float in [0,1] or "adaptive"')
     if topk < 1:
         raise ValueError("topk must be >= 1")
 
@@ -431,6 +439,13 @@ def create_graph_diffusion_candidates(
     seed["p0"] = (seed["seed_w"] / seed["customer_id"].map(totals)).astype("float32")
     p0 = seed[["customer_id", "article_id", "p0"]].copy()
     seed_items = p0[["customer_id", "article_id"]].copy()
+
+    restart_map = None
+    if restart_prob == "adaptive":
+        # customer-specific restart: if <3 seed items => 0.3 else 0.2
+        seed_counts = p0.groupby("customer_id")["article_id"].count()
+        restart_map = cudf.Series(0.2, index=seed_counts.index).astype("float32")
+        restart_map = restart_map.where(seed_counts >= 3, 0.3).astype("float32")
     del seed_t, seed
 
     # --- Graph edges (normalize outgoing weights) ---
@@ -462,9 +477,19 @@ def create_graph_diffusion_candidates(
         combined = propagated.merge(p0, on=["customer_id", "article_id"], how="outer")
         combined["prop_score"] = combined["prop_score"].fillna(0).astype("float32")
         combined["p0"] = combined["p0"].fillna(0).astype("float32")
-        combined["score"] = (
-            restart_prob * combined["p0"] + (1.0 - restart_prob) * combined["prop_score"]
-        ).astype("float32")
+        if restart_map is None:
+            rp = restart_prob
+            combined["score"] = (
+                rp * combined["p0"] + (1.0 - rp) * combined["prop_score"]
+            ).astype("float32")
+        else:
+            combined["_rp"] = combined["customer_id"].map(restart_map).fillna(0.2)
+            combined["_rp"] = combined["_rp"].astype("float32")
+            combined["score"] = (
+                combined["_rp"] * combined["p0"]
+                + (1.0 - combined["_rp"]) * combined["prop_score"]
+            ).astype("float32")
+            del combined["_rp"]
         cur = combined[["customer_id", "article_id", "score"]].copy()
 
         # normalize to keep numbers stable (optional but cheap)
