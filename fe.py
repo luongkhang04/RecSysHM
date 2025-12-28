@@ -82,7 +82,7 @@ def day_week_numbers(dates: cudf.Series):
     numbered_days = numbered_days.dt.days
     extra_days = numbered_days.max() % 7
     numbered_days -= extra_days
-    day_weeks = (numbered_days / 7).applymap(lambda x: math.ceil(x))
+    day_weeks = (numbered_days / 7).apply(lambda x: math.ceil(x))
     day_weeks_map = cudf.DataFrame(
         {"day_weeks": day_weeks, "unique_dates": unique_dates}
     ).set_index("unique_dates")["day_weeks"]
